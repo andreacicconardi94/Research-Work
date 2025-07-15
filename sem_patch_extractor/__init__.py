@@ -1,1 +1,0 @@
-from sem_tools.sem_patch_extractor import extract_patches_from_tif
