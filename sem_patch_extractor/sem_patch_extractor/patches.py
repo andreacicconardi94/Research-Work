@@ -39,33 +39,106 @@ Example (metadata mode)
 """
 from __future__ import annotations
 import re
-from pathlib import Path
 from typing import List, Optional
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import numpy as np
-from PIL import Image
-from scipy import ndimage
 
 # ---------------------------------------------------------------------------
 # Scalebar‐based functions
 # ---------------------------------------------------------------------------
 
-def detect_scalebar_length(image_path: str, crop_fraction: float = 0.10) -> int:
-    """Detect pixel length of 1 µm scalebar from bottom `crop_fraction` of image."""
+# Improved version of detect_scalebar_length_user_guided
+# Supports scalebars with vertical end caps (e.g., [——])
+
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+from PIL import Image
+from scipy import ndimage
+from pathlib import Path
+
+
+def detect_scalebar_length_user_guided(image_path: str, roi_size=(300, 60)) -> int:
+    """
+    Allows user to click near the scalebar and detects it from that region.
+
+    Parameters:
+        image_path (str): Path to the SEM image containing a scalebar.
+        roi_size (tuple): Size (width, height) of the region around the click to search the scalebar.
+
+    Returns:
+        int: Detected scalebar length in pixels (1 micron), or raises an error if detection fails.
+    """
     img = np.array(Image.open(image_path).convert("L"))
     h, w = img.shape
-    bottom = img[h - int(h * crop_fraction) : h, :]
-    thr = bottom.mean() + (bottom.max() - bottom.mean()) * 0.5
-    mask = bottom > thr
+
+    # Request user click
+    fig, ax = plt.subplots()
+    ax.imshow(img, cmap="gray")
+    ax.set_title("Click near the scalebar")
+    plt.axis("off")
+    coords = plt.ginput(1, timeout=0)
+    plt.close(fig)
+
+    if not coords:
+        raise ValueError("No click received. Aborting scalebar detection.")
+
+    cx, cy = map(int, coords[0])
+    rw, rh = roi_size
+
+    # Extract ROI
+    x0 = max(cx - rw // 2, 0)
+    x1 = min(cx + rw // 2, w)
+    y0 = max(cy - rh // 2, 0)
+    y1 = min(cy + rh // 2, h)
+    roi = img[y0:y1, x0:x1]
+
+    # Threshold ROI
+    thr = roi.mean() + 0.5 * (roi.max() - roi.mean())
+    mask = roi > thr
     lbl, n = ndimage.label(mask)
+
+    best_rect = None
     best_width = 0
+    min_distance = float('inf')
+
     for lab in range(1, n + 1):
-        cols = np.where(lbl == lab)[1]
-        if cols.size:
-            width = cols.max() - cols.min() + 1
-            if width > best_width:
-                best_width = width
+        coords = np.column_stack(np.where(lbl == lab))
+        if coords.size == 0:
+            continue
+        y_min, x_min = coords.min(axis=0)
+        y_max, x_max = coords.max(axis=0)
+        width = x_max - x_min + 1
+        height = y_max - y_min + 1
+        cx_r = (x_min + x_max) / 2
+        cy_r = (y_min + y_max) / 2
+        dist = (cx_r - rw/2)**2 + (cy_r - rh/2)**2
+        if dist < min_distance and width > roi.shape[1] * 0.3:
+            best_width = width
+            best_rect = (x_min, y_min, width, height)
+            min_distance = dist
+
+    if not best_rect:
+        raise ValueError("Scalebar could not be detected in the selected region.")
+
+    # Plot ROI with detected region
+    fig1, ax1 = plt.subplots()
+    ax1.imshow(roi, cmap="gray")
+    rect1 = mpatches.Rectangle((best_rect[0], best_rect[1]), best_rect[2], best_rect[3],
+                              linewidth=2, edgecolor="red", facecolor="none")
+    ax1.add_patch(rect1)
+    ax1.set_title(f"Scalebar in ROI: {best_width} px")
+    ax1.axis("off")
+
+    # Plot full image with selection location
+    fig2, ax2 = plt.subplots()
+    ax2.imshow(img, cmap="gray")
+    rect2 = mpatches.Rectangle((x0 + best_rect[0], y0 + best_rect[1]), best_rect[2], best_rect[3],
+                               linewidth=2, edgecolor="cyan", facecolor="none")
+    ax2.add_patch(rect2)
+    ax2.set_title("Scalebar position in full image")
+    ax2.axis("off")
+
+    plt.show()
+
     return best_width
 
 
@@ -76,21 +149,35 @@ def extract_patches_by_scalebar(
     patch_um: int = 1,
     overlap: int = 0,
 ) -> list[str]:
-    """Split SEM `full_image` into non‐overlapping patches of side `patch_um` µm.
+    """
+    Split SEM `full_image` into non-overlapping patches of side `patch_um` microns,
+    using a user-guided scalebar detection from `scalebar_image`.
 
-    1. Measure L = pixels for 1 µm via `scalebar_image`.
-    2. patch_px = patch_um * L
-    3. Slide window on `full_image`, step = patch_px − overlap.
-    4. Save PNG patches to `save_dir`.
-"""
-    L = detect_scalebar_length(scalebar_image)
+    Parameters:
+        scalebar_image (str): Image file with visible scalebar.
+        full_image (str): Image to divide into patches.
+        save_dir (str): Output directory to save patches.
+        patch_um (int): Side of the patch in microns.
+        overlap (int): Overlap between patches in pixels.
+
+    Returns:
+        list[str]: List of saved patch file paths.
+    """
+    L = detect_scalebar_length_user_guided(scalebar_image)
     if L <= 0:
         raise ValueError("Failed to detect scalebar length.")
+
     patch_px = patch_um * L
     img = np.array(Image.open(full_image).convert("L"))
     h, w = img.shape
     out_dir = Path(save_dir)
+
+    # Ensure output directory is clean
+    if out_dir.exists():
+        for file in out_dir.glob("*.png"):
+            file.unlink()
     out_dir.mkdir(parents=True, exist_ok=True)
+
     paths: list[str] = []
     step = patch_px - overlap
     idx = 0
@@ -102,53 +189,6 @@ def extract_patches_by_scalebar(
             paths.append(str(out_path))
             idx += 1
     return paths
-
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-
-
-def plot_scalebar_detection(image_path: str, crop_fraction: float = 0.10) -> None:
-    """Plot the detected scalebar region from the bottom of the image."""
-    img = np.array(Image.open(image_path).convert("L"))
-    h, w = img.shape
-    bottom = img[h - int(h * crop_fraction):, :]
-    
-    # Threshold for detecting the scalebar
-    thr = bottom.mean() + (bottom.max() - bottom.mean()) * 0.5
-    mask = bottom > thr
-    lbl, n = ndimage.label(mask)
-
-    best_rect = None
-    best_width = 0
-    for lab in range(1, n + 1):
-        coords = np.column_stack(np.where(lbl == lab))
-        if coords.size == 0:
-            continue
-        y_min, x_min = coords.min(axis=0)
-        y_max, x_max = coords.max(axis=0)
-        width = x_max - x_min + 1
-        if width > best_width:
-            best_width = width
-            best_rect = (x_min, y_min, width, y_max - y_min + 1)
-
-    # Plot
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.imshow(bottom, cmap="gray")
-    if best_rect:
-        rect = patches.Rectangle(
-            (best_rect[0], best_rect[1]),
-            best_rect[2],
-            best_rect[3],
-            linewidth=2,
-            edgecolor="red",
-            facecolor="none",
-        )
-        ax.add_patch(rect)
-        ax.set_title(f"Scalebar rilevata: {best_width} px (1 µm)")
-    else:
-        ax.set_title("Scalebar not detected.")
-    ax.axis("off")
-    plt.show()
 
 
 
